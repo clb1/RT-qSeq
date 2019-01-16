@@ -1,0 +1,115 @@
+SHELL = /bin/bash
+
+ROOT_DIR = /raid1/projects/CoveringPrimersSets
+SCRIPTS = ${ROOT_DIR}/scripts
+TARGET_SET_ROOT_DIR = ${ROOT_DIR}/${CGDB_VERSION}
+TARGET_SET_DIR = ${TARGET_SET_ROOT_DIR}/${TARGET_CLASS}
+
+OLAP_SETS_PKL_DIR = ${TARGET_SET_DIR}/pkl_olap_sets
+PREDESIGN_PKL_DIR = ${TARGET_SET_DIR}/${PARAMS_DESCRIPTOR}/pkl_predesign
+
+CGDB = /raid1/projects/CGDB/models
+CGDB_BED = ${CGDB}/${CGDB_VERSION}.bed
+SCRATCH_DIR = /raid1/projects/scratch
+GENOME_FASTA = /raid1/references_and_indexes/hg38/hg38.fa
+TRANSCRIPTOME_FASTA = /raid1/projects/CGDB/models/${CGDB_VERSION}.fa
+UNPROCESSED_TRANSCRIPTOME_FASTA = /raid1/projects/CGDB/models/${CGDB_VERSION}_w_introns.fa
+
+ALL_CHROM = chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 chr21 chr22 chrX chrY # chrM
+
+REQUIRED_PRIMERS_IN_EACH_PARTITION = /raid1/projects/OligoPool/RTqSeq_ERCC_standards/ERCC_standards_primers.tsv
+CONTROL_PRIMERS = /raid1/projects/OligoPool/RTqSeq_ERCC_standards/ERCC_control_primers_1.tsv
+
+TARGET_CLASS_TIGS = ${TARGET_SET_ROOT_DIR}/target_class_definitions/${TARGET_CLASS}/class_isoform_groups.txt
+
+
+.PHONY: all_predesign_sets predesign_%_sets complete_designs_for_%
+
+
+all_predesign_sets:
+    parallel -j 14 --verbose --no-notice '${MAKE} predesign_sets_for_{}.tsv &> predesign_sets_for_{}.err' ::: $(ALL_CHROM)
+
+all_complete_designs:
+    parallel -j 10 --verbose --no-notice '${MAKE} complete_designs_for_{} &> complete_designs_for_{}.err' ::: $(ALL_CHROM)
+
+
+# Should this be removed, and predesigns_sets_for_% below just use  ${TARGET_CLASS_TIGS}?
+target_isoform_groups.txt:
+    ln -s ${TARGET_CLASS_TIGS} target_isoform_groups.txt
+
+
+# % is "all" or comma-separated list of chromosomes (eg "chr1,chr2,chr3")
+olap_sets_for_%: ${TARGET_CLASS_TIGS}
+    ${SCRIPTS}/designSets.py create_olap_sets ${PARAMS_DESCRIPTOR} $* ${SCRATCH_DIR} $< ${CGDB_BED} pkl_olap_sets
+
+
+predesign_sets_for_%.tsv: target_isoform_groups.txt # Use ${TARGET_CLASS_TIGS} instead?
+    ${SCRIPTS}/designSets.py predesign ${PARAMS_DESCRIPTOR} $* ${SCRATCH_DIR} $< ${CGDB_BED} ${GENOME_FASTA} ${TRANSCRIPTOME_FASTA} \
+    main.db ../pkl_olap_sets pkl_predesign predesign_sets_for
+
+
+# subset_target_isoform_groups.txt is created by the including Makefile
+subset_olap_sets.tsv: subset_target_isoform_groups.txt
+    ${SCRIPTS}/designSets.py olap_sets_subset ${PARAMS_DESCRIPTOR} $< main.db $@
+
+
+complete_designs_for_%: subset_olap_sets.tsv
+    ${SCRIPTS}/designSets.py completedesign ${PARAMS_DESCRIPTOR} pkl_candidate_solns ${SCRATCH_DIR} <(egrep "^$*" $<) ${GENOME_FASTA} ${TRANSCRIPTOME_FASTA} main.db
+
+
+all_completedesigns_ranked.tsv:
+    ${SCRIPTS}/rankAllCompleteDesigns.py ${PARAMS_DESCRIPTOR} main.db $@
+
+
+# WARNING: needs to be smarter for general use. Okay for now.
+all_experiment_partitions_ranked.tsv: ranked_TIGs.txt
+    ${SCRIPTS}/rankPartitionedExperimentsByRankedTIGs.py ${PARAMS_DESCRIPTOR} <(cut -f 1 $<) main.db $@
+
+
+# Depracated: For array-based oligos
+#  ${PARTITION_REV_PRIMERS}
+array_design.fa: all_completedesigns_ranked.tsv ${REQUIRED_PRIMERS_IN_EACH_PARTITION}
+    ${SCRIPTS}/designArray.py ${PARAMS_DESCRIPTOR} main.db 8 $^ $@
+
+
+# Temporary solution. See below
+no_use_olap_sets.tsv: pool1/primers_fwd.tsv
+    cut -f 4 $< | egrep -v "ERCC" | sed 's/_/ /g' | sed 's/;/\n/g' > $@
+
+
+# The pool design logic needs to be extended to know what pools have already been created, so that
+# only new designs are produced.
+# TODO: designPool.py should add a table to main.db and record which have been used to create a pool.
+#       Record (chrom,OS_ID,part_num, PPR_ID,short plate name (eg poolX.# for multiplate pools),
+#               plate format (96/384), plate type (fwd/rev), well, primer name (eg fwd#/rev#))
+#
+# Rank olaps sets by num_tigs, etc criteria. Then select the first Npart set of primers that have not alread 
+# been selected for a previously designed pool. (Leave this descriptive text here.)
+%_primers: ranked_TIGs.txt no_use_olap_sets.tsv ${CONTROL_PRIMERS}
+    -mkdir $*
+    ${SCRIPTS}/designPool.py ${PARAMS_DESCRIPTOR} main.db 96 $^ $*/primers
+
+
+
+%/primers.fa %/primers_expected_products.fa %/primers_expected_products.bed %/primers_expected_products_lengths_hist.png: %/primers_fwd.tsv %/primers_rev.tsv
+    ${SCRIPTS}/compileAuxPrimerPoolData.py ${PARAMS_DESCRIPTOR} $* main.db ${GENOME_FASTA} ${TRANSCRIPTOME_FASTA} ${CGDB_BED} $^ $*/primers
+
+
+%/products_and_ctrls.fa: %/primers_expected_products.fa ctrls_and_ERCC_products.fa
+    cat $^ > $@
+
+
+%/legit_unintended_products.fa: %/primers_fwd.tsv %/primers_rev.tsv
+    ${SCRIPTS}/findLegitUnintendedProducts.py ${PARAMS_DESCRIPTOR} ${TRANSCRIPTOME_FASTA} $^ $@
+
+
+%/products_ctrls_unintended.fa: %/products_and_ctrls.fa %/legit_unintended_products.fa
+    cat $^ > $@
+
+
+%-hisat2-index: %/products_ctrls_unintended.fa
+    /usr/local/src/hisat2-2.0.4/hisat2-build  -p  5  -f  $<  $*/products_ctrls_unintended
+
+
+#%_covering_set_primers.gff3 %_covering_set_primers.tsv: 
+#    ${SCRIPTS}/designSets.py  $*_covering_set_primers.gff3 $*_covering_set_primers.tsv
